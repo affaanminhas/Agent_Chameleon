@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.env
 
 # IDE files
 .vscode/
@@ -16,5 +17,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# Your data (optional - maybe qeep, maybe ignore)
+# Your data (optional - maybe keep, maybe ignore)
 data/
+
+*.safetensors
+*.pt
+personas/*/checkpoint-*/

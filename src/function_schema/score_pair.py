@@ -10,13 +10,9 @@ Standalone test:
 """
 
 import os
+from function_schema.llm_config import get_client, get_model
 import re
 from typing import Optional
-
-from openai import OpenAI
-from dotenv import load_dotenv
-
-load_dotenv()
 
 QUALITY_THRESHOLD = 7
 
@@ -30,11 +26,13 @@ class ScorePair:
             "quality, and training value. Returns the integer score. "
             "Call with question (str), response (str), and subject (str)."
         )
-        self.client = OpenAI(
-            api_key=os.getenv("HF_TOKEN"),
-            base_url=os.getenv("HF_API_BASE", "https://router.huggingface.co/v1")
-        )
-        self.model = os.getenv("HF_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+        self.model = get_model()
+        self.client = None
+
+    def _get_client(self):
+        if self.client is None:
+            self.client = get_client()
+        return self.client
 
     def execute(self, question: str, response: str, subject: str) -> str:
         score = self._score(question, response, subject)
@@ -52,7 +50,7 @@ class ScorePair:
             f"Return ONLY a single integer 1–10. Nothing else."
         )
         try:
-            resp = self.client.chat.completions.create(
+            resp = self._get_client().chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,

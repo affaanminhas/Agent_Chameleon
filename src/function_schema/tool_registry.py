@@ -8,7 +8,7 @@ into this folder and it registers automatically on next run.
 
 import os
 import importlib.util
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 class ToolRegistry:
@@ -24,34 +24,48 @@ class ToolRegistry:
         if not os.path.isdir(directory):
             print(f"   ⚠️  Tool directory not found: {directory}")
             return
+
         for filename in os.listdir(directory):
             if not filename.endswith(".py") or filename in skip:
                 continue
-            filepath = os.path.join(directory, filename)
+
+            filepath    = os.path.join(directory, filename)
             module_name = filename[:-3]
+
             try:
-                spec = importlib.util.spec_from_file_location(module_name, filepath)
+                spec   = importlib.util.spec_from_file_location(module_name, filepath)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
+
                 for attr_name in dir(module):
                     attr = getattr(module, attr_name)
-                    if (
-                        isinstance(attr, type)
-                        and attr_name not in ("object",)
-                        and hasattr(attr, "name")
-                        and hasattr(attr, "description")
-                        and hasattr(attr, "execute")
-                    ):
-                        try:
-                            instance = attr()
+
+                    # Only look at classes, skip builtins
+                    if not isinstance(attr, type):
+                        continue
+                    if attr_name in ("object",):
+                        continue
+                    # Must have an execute method defined on the class
+                    if not callable(getattr(attr, "execute", None)):
+                        continue
+
+                    # Instantiate and then check instance attributes
+                    try:
+                        instance = attr()
+                        if (
+                            hasattr(instance, "name")
+                            and hasattr(instance, "description")
+                            and instance.name
+                        ):
                             self.register(
                                 name=instance.name,
                                 func=instance.execute,
                                 description=instance.description,
                             )
                             print(f"   ✅ Registered: {instance.name} ({filename})")
-                        except Exception as e:
-                            print(f"   ⚠️  Could not instantiate {attr_name}: {e}")
+                    except Exception as e:
+                        print(f"   ⚠️  Could not instantiate {attr_name} from {filename}: {e}")
+
             except Exception as e:
                 print(f"   ⚠️  Could not load {filename}: {e}")
 

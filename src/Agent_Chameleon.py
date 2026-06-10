@@ -1,28 +1,21 @@
 """
 Agent Chameleon — Training Pair Generator
-======================================
+==========================================
 Autonomous agent that scrapes the web for a given subject and
 generates high-quality LLM fine-tuning pairs in your chosen format.
 
 Usage:
-    python Agent_Chameleon.py
-
-The agent will ask for:
-    - Subject        (e.g. "Marie Curie", "CQC safe staffing")
-    - Target pairs   (e.g. 1000)
-    - Output format  (alpaca / sharegpt / openai)
+    python src/Agent_Chameleon.py
 
 Workflow:
-    collect  →  transform  →  output
-    LLM reads the result of each stage and decides whether to
-    continue, retry with a different source, or stop early.
+    Phase 1 — direct sources (quotes + interviews)
+    Phase 2 — fallback transform (only if pairs < target after Phase 1)
 """
 
 import os
 import re
 import json
 import time
-from datetime import datetime
 from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
@@ -34,55 +27,39 @@ load_dotenv()
 
 # ── LLM config ────────────────────────────────────────────────────────
 
-HF_TOKEN     = os.getenv("HF_TOKEN")
-API_BASE_URL = os.getenv("HF_API_BASE", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("HF_MODEL",    "meta-llama/Llama-3.3-70B-Instruct")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+API_BASE_URL = os.getenv("HF_API_BASE", "https://api.groq.com/openai/v1")
+MODEL_NAME   = os.getenv("HF_MODEL",    "llama-3.3-70b-versatile")
 
 QUALITY_THRESHOLD = 7
 REQUEST_DELAY     = 1.0
+MAX_RETRIES       = 2
 
-
-# ══════════════════════════════════════════════════════════════════════
-# AGENT
-# ══════════════════════════════════════════════════════════════════════
 
 class AgentChameleon:
-    """
-    Autonomous training pair generator.
-    Workflow stages are defined here. Tools live in function_schema/.
-    The LLM makes quality decisions between stages.
-    """
 
     def __init__(self):
-        # ── LLM client ────────────────────────────────────────────────
-        self.client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+        self.client = OpenAI(api_key=GROQ_API_KEY, base_url=API_BASE_URL)
 
-        # ── Tool registry (auto-discovers function_schema/) ───────────
         self.tools = ToolRegistry()
         self.tools.auto_discover(
             os.path.join(os.path.dirname(__file__), "function_schema")
         )
 
-        # ── Session config (set by main()) ────────────────────────────
-        self.subject       : str = ""
-        self.target_pairs  : int = 0
-        self.output_format : str = ""
-        self.output_path   : str = ""
+        self.subject       : str            = ""
+        self.target_pairs  : int            = 0
+        self.output_format : str            = ""
+        self.output_path   : str            = ""
 
-        # ── Runtime state ─────────────────────────────────────────────
-        self.pairs_written : int  = 0
-        self.seen_hashes   : list = []
-        self.session_log   : List[Dict] = []
-
-    # ══════════════════════════════════════════════════════════════════
-    # ENTRY POINT
-    # ══════════════════════════════════════════════════════════════════
+        self.pairs_written : int            = 0
+        self.seen_hashes   : list           = []
+        self.topic_counts  : Dict[str, int] = {}
+        self.session_log   : List[Dict]     = []
 
     def main(self):
         self._print_header()
 
-        # ── User inputs ───────────────────────────────────────────────
-        self.subject = input("  Subject (e.g. Marie Curie): ").strip()
+        self.subject = input("  Subject (e.g. Steve Jobs): ").strip()
         if not self.subject:
             print("  Subject cannot be empty.")
             return
@@ -90,160 +67,248 @@ class AgentChameleon:
         target_raw = input("  Target pairs (default 1000): ").strip()
         self.target_pairs = int(target_raw) if target_raw.isdigit() else 1000
 
-        fmt_raw = input("  Format — alpaca / sharegpt / openai (default alpaca): ").strip().lower()
-        self.output_format = fmt_raw if fmt_raw in ["alpaca", "sharegpt", "openai"] else "alpaca"
+        fmt_raw = input(
+            "  Format — alpaca / sharegpt / openai (default alpaca): "
+        ).strip().lower()
+        self.output_format = (
+            fmt_raw if fmt_raw in ["alpaca", "sharegpt", "openai"] else "alpaca"
+        )
 
-        timestamp        = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name        = re.sub(r"[^a-z0-9_]", "_", self.subject.lower())
-        self.output_path = f"./data/output/{safe_name}_{timestamp}.jsonl"
+        self.output_path = f"./data/output/{safe_name}.jsonl"
 
-        print(f"\n  ✅ Config saved:")
+        print(f"\n  Config:")
         print(f"     Subject  : {self.subject}")
         print(f"     Pairs    : {self.target_pairs}")
         print(f"     Format   : {self.output_format}")
-        print(f"     Output   : {self.output_path}")
-        print(f"\n  Starting...\n")
+        print(f"     Output   : {self.output_path}\n")
 
-        # ── Run workflow ──────────────────────────────────────────────
         self._run()
 
-    # ══════════════════════════════════════════════════════════════════
-    # WORKFLOW
-    # ══════════════════════════════════════════════════════════════════
-
     def _run(self):
-        """
-        Main loop. Discovers URL batches, then processes each source
-        through collect → transform → output. LLM checks quality
-        after transform and decides whether to write or retry.
-        """
-        url_limit = max(self.target_pairs * 3, 60)
-        urls      = self._stage_collect_urls(url_limit)
+        # URL limit scales with target — 3x headroom per topic
+        url_limit = max(self.target_pairs * 3, 90)
 
-        if not urls:
-            print("  ❌ No URLs found. Check your subject and network connection.")
+        print("  Discovering sources...")
+        print(f"  DEBUG tools registered: {self.tools.list_tools()}")
+        raw = self.tools.execute("discover_urls", {
+             "subject":      self.subject,
+             "limit":        url_limit,
+             "target_pairs": self.target_pairs
+             })
+        print(f"  DEBUG raw result: {raw[:200] if raw else 'EMPTY'}")
+
+        try:
+            all_sources = json.loads(raw) if raw else []
+        except Exception:
+            all_sources = []
+
+        if not all_sources:
+            print("  No URLs found. Check your subject and network connection.")
             return
 
-        print(f"  Found {len(urls)} candidate sources\n")
+        quotes     = [s for s in all_sources if s["source_type"] == "quote"]
+        interviews = [s for s in all_sources if s["source_type"] == "interview"]
+        fallback   = [s for s in all_sources if s["source_type"] == "fallback"]
 
-        for i, url in enumerate(urls):
-            if self.pairs_written >= self.target_pairs:
-                break
+        print(f"\n  quotes: {len(quotes)}  "
+              f"interviews: {len(interviews)}  "
+              f"fallback: {len(fallback)}\n")
 
-            print(f"  [{i+1}/{len(urls)}] {url[:70]}")
-            self._process_source(url)
-            time.sleep(REQUEST_DELAY)
+        # Phase 1 — direct sources
+        print("  Phase 1 — quotes + interviews")
+        self._process_sources(quotes,     "quote")
+        self._process_sources(interviews, "interview")
+
+        # Phase 2 — fallback only if still short
+        if self.pairs_written < self.target_pairs:
+            remaining = self.target_pairs - self.pairs_written
+            print(f"\n  Phase 2 — fallback "
+                  f"({self.pairs_written}/{self.target_pairs}, "
+                  f"need {remaining} more)")
+            self._process_sources(fallback, "fallback")
 
         self._print_summary()
 
-    def _stage_collect_urls(self, limit: int) -> List[str]:
-        """Stage 1 — discover sources."""
-        print("  Stage 1 — discovering sources...")
-        raw = self.tools.execute("discover_urls", {
-            "subject": self.subject,
-            "limit": limit
-        })
-        try:
-            return json.loads(raw)
-        except Exception:
-            return []
+    def _process_sources(self, sources: List[Dict], source_type: str):
+        for i, source in enumerate(sources):
+            if self.pairs_written >= self.target_pairs:
+                break
+            url   = source["url"]
+            topic = source.get("topic", "general")
+            print(f"  [{i+1}/{len(sources)}] [{source_type:10}] "
+                  f"[{topic[:18]:18}] {url[:50]}")
 
-    def _process_source(self, url: str):
-        """Scrape one URL, chunk it, then run each chunk through transform → score → write."""
+            if source_type == "quote":
+                self._process_quote(url, topic)
+            elif source_type == "interview":
+                self._process_interview(url, topic)
+            else:
+                self._process_fallback(url, topic)
 
-        # ── Collect stage ─────────────────────────────────────────────
-        text = self.tools.execute("scrape_url", {"url": url})
-        if not text or len(text.split()) < 100:
-            self._log(url, "collect", "skip", "too short or empty")
+            time.sleep(REQUEST_DELAY)
+
+    def _process_quote(self, url: str, topic: str):
+        scraped = json.loads(
+            self.tools.execute("scrape_url", {
+                "url": url, "source_type": "quote"
+            })
+        )
+        text = scraped.get("text", "")
+        if not text:
+            self._log(url, "quote", "skip", "empty")
             return
 
         result = json.loads(
             self.tools.execute("chunk_and_filter", {
-                "text": text,
-                "seen_hashes": json.dumps(self.seen_hashes)
+                "text":        text,
+                "seen_hashes": json.dumps(self.seen_hashes),
+                "source_type": "quote"
             })
         )
         chunks           = result.get("chunks", [])
         self.seen_hashes = result.get("seen_hashes", self.seen_hashes)
 
-        if not chunks:
-            self._log(url, "collect", "skip", "no valid chunks after filter")
-            return
+        print(f"     {len(chunks)} quotes")
 
-        print(f"     {len(chunks)} chunks")
-
-        # ── Transform + output per chunk ──────────────────────────────
         for chunk in chunks:
             if self.pairs_written >= self.target_pairs:
                 break
-            self._stage_transform_and_output(chunk, url)
+            cleaned = self.tools.execute("clean_direct_quote", {
+                "quote": chunk, "subject": self.subject
+            })
+            if not cleaned or len(cleaned.split()) < 8:
+                continue
+            question = self.tools.execute("generate_question", {
+                "response": cleaned, "subject": self.subject
+            })
+            if not question:
+                continue
+            self._score_and_write(question, cleaned, topic, url)
 
-    def _stage_transform_and_output(self, chunk: str, source_url: str, retry: int = 0):
-        """
-        Stage 2 — transform chunk to voice and generate question.
-        Stage 3 — LLM scores the pair; writes if above threshold, retries once if not.
-        """
-        max_retries = 2
+    def _process_interview(self, url: str, topic: str):
+        scraped = json.loads(
+            self.tools.execute("scrape_url", {
+                "url": url, "source_type": "interview"
+            })
+        )
+        text = scraped.get("text", "")
+        if not text or len(text.split()) < 100:
+            self._log(url, "interview", "skip", "too short")
+            return
 
-        # Transform
+        pairs_raw = self.tools.execute("fix_interview_pairs", {
+            "transcript": text, "subject": self.subject
+        })
+        try:
+            pairs = json.loads(pairs_raw)
+        except Exception:
+            self._log(url, "interview", "skip", "could not parse pairs")
+            return
+
+        print(f"     {len(pairs)} interview pairs")
+
+        for pair in pairs:
+            if self.pairs_written >= self.target_pairs:
+                break
+            question = pair.get("question", "").strip()
+            response = pair.get("response", "").strip()
+            if not question or not response:
+                continue
+            self._score_and_write(question, response, topic, url)
+
+    def _process_fallback(self, url: str, topic: str):
+        scraped = json.loads(
+            self.tools.execute("scrape_url", {
+                "url": url, "source_type": "fallback"
+            })
+        )
+        text = scraped.get("text", "")
+        if not text or len(text.split()) < 100:
+            self._log(url, "fallback", "skip", "too short")
+            return
+
+        result = json.loads(
+            self.tools.execute("chunk_and_filter", {
+                "text":        text,
+                "seen_hashes": json.dumps(self.seen_hashes),
+                "source_type": "fallback"
+            })
+        )
+        chunks           = result.get("chunks", [])
+        self.seen_hashes = result.get("seen_hashes", self.seen_hashes)
+
+        print(f"     {len(chunks)} chunks")
+
+        for chunk in chunks:
+            if self.pairs_written >= self.target_pairs:
+                break
+            self._process_fallback_chunk(chunk, topic, url)
+
+    def _process_fallback_chunk(
+        self, chunk: str, topic: str, source_url: str, retry: int = 0
+    ):
         response = self.tools.execute("transform_to_voice", {
-            "chunk": chunk,
-            "subject": self.subject
+            "chunk": chunk, "subject": self.subject
         })
         if not response or len(response.split()) < 15:
-            self._log(source_url, "transform", "skip", "empty response from LLM")
             return
 
-        # Generate question
         question = self.tools.execute("generate_question", {
-            "response": response,
-            "subject": self.subject
+            "response": response, "subject": self.subject
         })
         if not question:
-            self._log(source_url, "generate_question", "skip", "no question generated")
             return
 
-        # Score — this is the LLM quality gate
-        score = int(self.tools.execute("score_pair", {
-            "question": question,
-            "response": response,
-            "subject": self.subject
-        }) or 0)
+        scored = self._score_and_write(question, response, topic, source_url)
+        if not scored and retry < MAX_RETRIES:
+            self._process_fallback_chunk(
+                chunk, topic, source_url, retry=retry + 1
+            )
+
+    def _score_and_write(
+        self,
+        question: str,
+        response: str,
+        topic: str,
+        source_url: str
+    ) -> bool:
+        score = int(
+            self.tools.execute("score_pair", {
+                "question": question,
+                "response": response,
+                "subject":  self.subject
+            }) or 0
+        )
 
         if score < QUALITY_THRESHOLD:
-            self._log(source_url, "score", "low", f"score {score} < {QUALITY_THRESHOLD}")
-            # Retry once with the same chunk — different temperature may improve output
-            if retry < max_retries:
-                print(f"     ↻ Score {score} — retrying transform ({retry+1}/{max_retries})")
-                self._stage_transform_and_output(chunk, source_url, retry=retry + 1)
-            return
+            self._log(source_url, "score", "low", f"score {score}")
+            return False
 
-        # Write
-        write_result = self.tools.execute("write_output", {
-            "question": question,
-            "response": response,
-            "subject": self.subject,
+        self.tools.execute("write_output", {
+            "question":      question,
+            "response":      response,
+            "subject":       self.subject,
             "output_format": self.output_format,
-            "output_path": self.output_path,
-            "pair_index": self.pairs_written
+            "output_path":   self.output_path,
+            "pair_index":    self.pairs_written,
         })
 
         self.pairs_written += 1
-        self._log(source_url, "write", "ok", f"pair {self.pairs_written} score={score}")
+        self.topic_counts[topic] = self.topic_counts.get(topic, 0) + 1
+        self._log(source_url, "write", "ok",
+                  f"pair {self.pairs_written} score={score}")
 
         if self.pairs_written % 50 == 0:
-            print(f"  ✅ {self.pairs_written}/{self.target_pairs} pairs written")
+            print(f"\n  {self.pairs_written}/{self.target_pairs} pairs written")
+            self._print_topic_balance()
 
-    # ══════════════════════════════════════════════════════════════════
-    # HELPERS
-    # ══════════════════════════════════════════════════════════════════
+        return True
 
     def _log(self, source: str, stage: str, status: str, note: str):
         self.session_log.append({
-            "source": source[:60],
-            "stage": stage,
-            "status": status,
-            "note": note
+            "source": source[:60], "stage": stage,
+            "status": status, "note": note
         })
 
     def _print_header(self):
@@ -251,21 +316,30 @@ class AgentChameleon:
         print("  Agent Chameleon — Training Pair Generator")
         print("=" * 60 + "\n")
 
+    def _print_topic_balance(self):
+        if not self.topic_counts:
+            return
+        print("  Topic balance:")
+        for topic, count in sorted(
+            self.topic_counts.items(), key=lambda x: -x[1]
+        ):
+            bar = "█" * min(count, 30)
+            print(f"    {topic[:22]:22} {bar} {count}")
+
     def _print_summary(self):
         ok      = len([l for l in self.session_log if l["status"] == "ok"])
-        skipped = len([l for l in self.session_log if l["status"] in ("skip", "low")])
+        skipped = len([l for l in self.session_log
+                       if l["status"] in ("skip", "low")])
         print("\n" + "=" * 60)
         print(f"  Done.")
         print(f"  Pairs written : {self.pairs_written}")
-        print(f"  Written       : {ok}")
+        print(f"  Logged ok     : {ok}")
         print(f"  Skipped/low   : {skipped}")
-        print(f"  Output file   : {self.output_path}")
+        print(f"  Output        : {self.output_path}")
+        print()
+        self._print_topic_balance()
         print("=" * 60 + "\n")
 
-
-# ══════════════════════════════════════════════════════════════════════
-# RUN
-# ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     agent = AgentChameleon()

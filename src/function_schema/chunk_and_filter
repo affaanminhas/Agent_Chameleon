@@ -1,0 +1,131 @@
+"""
+Chunk and Filter Tool
+Path: function_schema/chunk_and_filter.py
+
+Splits raw scraped text into clean, usable segments between
+MIN and MAX word counts. Removes boilerplate and duplicates.
+
+Standalone test:
+    python function_schema/chunk_and_filter.py
+"""
+
+import re
+import json
+import hashlib
+from typing import List
+
+CHUNK_MIN_WORDS = 60
+CHUNK_MAX_WORDS = 250
+
+BOILERPLATE = [
+    r"all rights reserved",
+    r"privacy policy",
+    r"terms of (use|service)",
+    r"cookie policy",
+    r"subscribe (now|today)",
+    r"sign up for",
+    r"advertisement",
+    r"sponsored content",
+    r"share this (article|page)",
+    r"follow us on",
+]
+
+
+class ChunkAndFilter:
+
+    def __init__(self):
+        self.name = "chunk_and_filter"
+        self.description = (
+            "Splits raw scraped text into clean segments between 60–250 words. "
+            "Removes boilerplate, duplicates, and low-signal content. "
+            "Call with text (str) and seen_hashes (JSON str of already-seen hashes). "
+            "Returns JSON: {chunks: [...], seen_hashes: [...]}"
+        )
+
+    def execute(self, text: str, seen_hashes: str = "[]") -> str:
+        seen = set(json.loads(seen_hashes))
+        chunks, updated_seen = self._process(text, seen)
+        return json.dumps({"chunks": chunks, "seen_hashes": list(updated_seen)})
+
+    def _process(self, text: str, seen: set):
+        raw_chunks = self._split(text)
+        clean, updated_seen = [], set(seen)
+
+        for chunk in raw_chunks:
+            h = hashlib.md5(chunk.lower().encode()).hexdigest()
+            if h in updated_seen:
+                continue
+            updated_seen.add(h)
+
+            if self._is_boilerplate(chunk):
+                continue
+
+            # Reject chunks that are mostly non-alphabetic (tables, code)
+            alpha = sum(1 for c in chunk if c.isalpha())
+            if len(chunk) > 0 and alpha / len(chunk) < 0.6:
+                continue
+
+            clean.append(chunk)
+
+        return clean, updated_seen
+
+    def _split(self, text: str) -> List[str]:
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+        chunks, buffer = [], ""
+
+        for para in paragraphs:
+            combined = (buffer + " " + para).strip()
+            wc = len(combined.split())
+
+            if wc > CHUNK_MAX_WORDS:
+                if buffer:
+                    chunks.append(buffer.strip())
+                if len(para.split()) > CHUNK_MAX_WORDS:
+                    chunks.extend(self._split_sentences(para))
+                else:
+                    buffer = para
+            else:
+                buffer = combined
+
+        if buffer and len(buffer.split()) >= CHUNK_MIN_WORDS:
+            chunks.append(buffer.strip())
+
+        return chunks
+
+    def _split_sentences(self, text: str) -> List[str]:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        chunks, buf = [], ""
+        for s in sentences:
+            candidate = (buf + " " + s).strip()
+            if len(candidate.split()) >= CHUNK_MIN_WORDS:
+                chunks.append(candidate)
+                buf = ""
+            else:
+                buf = candidate
+        if buf and len(buf.split()) >= CHUNK_MIN_WORDS:
+            chunks.append(buf)
+        return chunks
+
+    def _is_boilerplate(self, text: str) -> bool:
+        lower = text.lower()
+        return any(re.search(p, lower) for p in BOILERPLATE)
+
+
+if __name__ == "__main__":
+    sample = """
+    Marie Curie was a Polish and naturalised-French physicist and chemist who conducted
+    pioneering research on radioactivity. She was the first woman to win a Nobel Prize,
+    the first person to win the Nobel Prize twice, and the only person to win the Nobel
+    Prize in two different sciences.
+
+    Subscribe now to get more articles like this delivered to your inbox every week.
+
+    Born in Warsaw in 1867, she studied secretly at the Flying University before moving
+    to Paris in 1891 to pursue her education. Her work led to the discovery of polonium
+    and radium, elements she named and isolated in her laboratory.
+    """
+    tool   = ChunkAndFilter()
+    result = json.loads(tool.execute(text=sample))
+    print(f"Chunks: {len(result['chunks'])}")
+    for c in result["chunks"]:
+        print(f"  [{len(c.split())} words] {c[:80]}...")
